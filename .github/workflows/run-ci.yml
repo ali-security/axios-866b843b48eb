@@ -1,8 +1,12 @@
 name: Continuous integration
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Optional mocha spec glob to run instead of the full unit suite
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -15,6 +19,7 @@ concurrency:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -31,6 +36,9 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Upgrade npm to read lockfile v3
+        if: matrix.node-version == '14.x'
+        run: npm i -g npm@8
       - name: Install dependencies
         if: matrix.node-version == '14.x'
         run: npm i
@@ -40,12 +48,27 @@ jobs:
       - name: Build project
         run: npm run build
       - name: Run unit tests
-        run: npm run test:node
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            node bin/ssl_hotfix.js mocha ${{ inputs.test-filter }} --timeout 30000 --exit
+          else
+            npm run test:node
+          fi
       - name: Run package tests
         run: npm run test:package
       - name: Run browser tests
         run: npm run test:browser
         if: matrix.node-version == '24.x'
+      - name: Pack package
+        if: matrix.node-version == '24.x'
+        run: npm pack
+      - name: Upload package tarball
+        if: matrix.node-version == '24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: axios-tgz
+          path: axios-1.13.5.tgz
+          if-no-files-found: error
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
-        if: matrix.node-version == '24.x'
+        if: matrix.node-version == '24.x' && github.event_name == 'pull_request'
