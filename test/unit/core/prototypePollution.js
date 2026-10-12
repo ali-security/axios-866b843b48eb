@@ -59,6 +59,7 @@ describe("Prototype Pollution Protection", function () {
     delete Object.prototype.url;
     delete Object.prototype.data;
     delete Object.prototype.httpVersion;
+    delete Object.prototype.validateStatus;
   });
 
   describe("utils.merge", function () {
@@ -573,6 +574,109 @@ describe("Prototype Pollution Protection", function () {
       const res = await axios.get(serverURL(server), { proxy: false });
 
       assert.strictEqual(res.data.role, "user");
+    });
+  });
+
+  // GHSA-w9j2-pvgh-6h63: mergeDirectKeys must not inherit validateStatus from
+  // Object.prototype (was using the `in` operator which traverses the chain).
+  describe("GHSA-w9j2-pvgh-6h63 validateStatus merge", function () {
+    const startStatusServer = (status) =>
+      new Promise((resolve) => {
+        const server = http.createServer((req, res) => {
+          res.writeHead(status, {
+            "Content-Type": "application/json",
+            Connection: "close",
+          });
+          res.end('{"error":"unauthorized"}');
+        });
+        server.listen(0, "127.0.0.1", () => resolve(server));
+      });
+
+    let server;
+
+    afterEach(async function () {
+      if (server) {
+        await stopServer(server);
+        server = null;
+      }
+    });
+
+    it("should not inherit a polluted validateStatus during mergeConfig", function () {
+      Object.prototype.validateStatus = () => true;
+
+      const merged = mergeConfig(defaults, { url: "/x" });
+
+      assert.strictEqual(merged.validateStatus, defaults.validateStatus);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(merged, "validateStatus"),
+        true,
+      );
+      assert.strictEqual(merged.validateStatus(401), false);
+      assert.strictEqual(merged.validateStatus(500), false);
+    });
+
+    it("should keep a validateStatus owned only by config1 when Object.prototype.validateStatus is polluted", function () {
+      const validateStatus = function (status) {
+        return status === 200;
+      };
+      Object.prototype.validateStatus = () => true;
+
+      const merged = mergeConfig({ validateStatus }, {});
+
+      assert.strictEqual(merged.validateStatus, validateStatus);
+    });
+
+    it("should still honor an explicit validateStatus from config2", function () {
+      const custom = function (status) {
+        return status < 500;
+      };
+      Object.prototype.validateStatus = () => true;
+
+      assert.strictEqual(
+        mergeConfig(defaults, { validateStatus: custom }).validateStatus,
+        custom,
+      );
+      assert.strictEqual(
+        mergeConfig(defaults, { validateStatus: null }).validateStatus,
+        null,
+      );
+    });
+
+    it("should keep 4xx/5xx responses rejected when Object.prototype.validateStatus is polluted", async function () {
+      server = await startStatusServer(401);
+      Object.prototype.validateStatus = () => true;
+
+      let threw = false;
+      try {
+        await axios.get(serverURL(server), { proxy: false });
+      } catch (err) {
+        threw = true;
+        assert.strictEqual(err.response.status, 401);
+        assert.strictEqual(err.code, "ERR_BAD_REQUEST");
+      }
+      assert.strictEqual(threw, true);
+    });
+
+    it("should keep 5xx responses rejected for instances created after Object.prototype.validateStatus is polluted", async function () {
+      server = await startStatusServer(500);
+      Object.prototype.validateStatus = () => true;
+
+      const instance = axios.create();
+
+      assert.strictEqual(
+        instance.defaults.validateStatus,
+        defaults.validateStatus,
+      );
+
+      let threw = false;
+      try {
+        await instance.get(serverURL(server), { proxy: false });
+      } catch (err) {
+        threw = true;
+        assert.strictEqual(err.response.status, 500);
+        assert.strictEqual(err.code, "ERR_BAD_RESPONSE");
+      }
+      assert.strictEqual(threw, true);
     });
   });
 });
