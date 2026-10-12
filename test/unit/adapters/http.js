@@ -119,6 +119,30 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            xTest: req.headers['x-test'],
+            injected: req.headers.injected === undefined ? null : req.headers.injected
+          })
+        );
+      },
+      { port: SERVER_PORT }
+    );
+
+    const { data } = await axios.get(`http://localhost:${server.address().port}/`, {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    assert.strictEqual(data.xTest, 'okInjected: yes');
+    assert.strictEqual(data.injected, null);
+  });
+
   it('should throw an error if the timeout property is not parsable as a number', function (done) {
 
     server = http.createServer(function (req, res) {
@@ -1267,6 +1291,114 @@ describe('supports http with nodejs', function () {
       process.env.no_proxy = originalNoProxy || '';
       process.env.NO_PROXY = originalNOProxy || '';
     }
+  });
+
+  describe('no_proxy loopback aliases', function () {
+    let originalEnv;
+    let proxyServer;
+    let proxyRequests;
+
+    const useProxyWithNoProxy = async (noProxyValue) => {
+      proxyServer = await startHTTPServer(
+        (_, response) => {
+          proxyRequests += 1;
+          response.end('proxied');
+        },
+        { port: 4447 }
+      );
+
+      const proxyUrl = `http://localhost:${proxyServer.address().port}/`;
+      process.env.http_proxy = proxyUrl;
+      process.env.HTTP_PROXY = proxyUrl;
+      process.env.no_proxy = noProxyValue;
+      process.env.NO_PROXY = noProxyValue;
+    };
+
+    beforeEach(function () {
+      proxyRequests = 0;
+      proxyServer = null;
+      originalEnv = {
+        http_proxy: process.env.http_proxy,
+        HTTP_PROXY: process.env.HTTP_PROXY,
+        no_proxy: process.env.no_proxy,
+        NO_PROXY: process.env.NO_PROXY
+      };
+    });
+
+    afterEach(async function () {
+      await stopHTTPServer(proxyServer);
+      proxyServer = null;
+
+      Object.keys(originalEnv).forEach((key) => {
+        if (originalEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = originalEnv[key];
+        }
+      });
+    });
+
+    it('should not use proxy for 127.0.0.1 when no_proxy is localhost', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost');
+
+      await assert.rejects(axios.get('http://127.0.0.1:1/', { timeout: 100 }));
+      assert.strictEqual(proxyRequests, 0, 'should not use proxy for IPv4 loopback alias');
+    });
+
+    it('should not use proxy for [::1] when no_proxy is localhost', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost');
+
+      await assert.rejects(axios.get('http://[::1]:1/', { timeout: 100 }));
+      assert.strictEqual(proxyRequests, 0, 'should not use proxy for IPv6 loopback alias');
+    });
+
+    it('should not use proxy for localhost when no_proxy is 127.0.0.1', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('127.0.0.1');
+
+      await assert.rejects(axios.get('http://localhost:1/', { timeout: 100 }));
+      assert.strictEqual(proxyRequests, 0, 'should not use proxy for localhost alias');
+    });
+
+    it('should not use proxy for addresses in 127.0.0.0/8 when no_proxy lists loopback', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost,127.0.0.1,::1');
+
+      await assert.rejects(axios.get('http://127.0.0.2:1/secret', { timeout: 100 }));
+      await assert.rejects(axios.get('http://127.1.2.3:1/secret', { timeout: 100 }));
+      assert.strictEqual(proxyRequests, 0, 'should not use proxy for 127.0.0.0/8 addresses');
+    });
+
+    it('should not use proxy for IPv4-mapped IPv6 loopback when no_proxy is localhost', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost');
+
+      await assert.rejects(axios.get('http://[::ffff:127.0.0.1]:1/', { timeout: 100 }));
+      assert.strictEqual(proxyRequests, 0, 'should not use proxy for IPv4-mapped IPv6 loopback');
+    });
+
+    it('should keep loopback alias matching port-aware', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost:8080');
+
+      const {data} = await axios.get('http://127.0.0.1:1/', { timeout: 1000 });
+      assert.strictEqual(data, 'proxied');
+      assert.strictEqual(proxyRequests, 1, 'should use proxy when the no_proxy port does not match');
+    });
+
+    it('should still use proxy for non-loopback addresses when no_proxy lists loopback', async function () {
+      this.timeout(10000);
+      await useProxyWithNoProxy('localhost,127.0.0.1,::1');
+
+      for (const target of ['http://128.0.0.1:1/', 'http://126.255.255.255:1/', 'http://10.0.0.127:1/', 'http://200.127.0.1:1/']) {
+        const {data} = await axios.get(target, { timeout: 1000 });
+        assert.strictEqual(data, 'proxied', `should use proxy for ${target}`);
+      }
+
+      assert.strictEqual(proxyRequests, 4);
+    });
   });
 
   it('should use proxy for domains not in no_proxy', function (done) {

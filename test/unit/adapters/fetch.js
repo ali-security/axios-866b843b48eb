@@ -35,6 +35,27 @@ describe('supports fetch with nodejs', function () {
     server = null;
   });
 
+  it('should sanitize request headers containing CRLF characters', async () => {
+    server = await startHTTPServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          xTest: req.headers['x-test'],
+          injected: req.headers.injected === undefined ? null : req.headers.injected
+        })
+      );
+    });
+
+    const { data } = await fetchAxios.get('/', {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    assert.strictEqual(data.xTest, 'okInjected: yes');
+    assert.strictEqual(data.injected, null);
+  });
+
   describe('responses', async () => {
     it(`should support text response type`, async () => {
       const originalData = 'my data';

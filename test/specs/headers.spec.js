@@ -156,4 +156,21 @@ describe('headers', function () {
     });
 
   });
+
+  it('should sanitize request headers containing CRLF characters', async () => {
+    const responsePromise = axios('/foo', {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    const request = await getAjaxRequest();
+
+    testHeaderValue(request.requestHeaders, 'x-test', 'okInjected: yes');
+    expect(request.requestHeaders.Injected).toEqual(undefined);
+
+    request.respondWith({status: 200});
+
+    await responsePromise;
+  });
 });

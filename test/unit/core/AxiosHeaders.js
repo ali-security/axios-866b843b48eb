@@ -468,4 +468,36 @@ describe('AxiosHeaders', function () {
       assert.deepStrictEqual(new AxiosHeaders().getSetCookie(), []);
     });
   });
+
+  describe('header value sanitization', function () {
+    it('should sanitize invalid characters in header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('x-test', '\t safe\r\nInjected: true \u0000');
+
+      assert.strictEqual(headers.get('x-test'), 'safeInjected: true');
+    });
+
+    it('should sanitize invalid characters in any array header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('set-cookie', ['safe=1', ' \tunsafe=1\nInjected: true\r\n ']);
+
+      assert.deepStrictEqual(headers.get('set-cookie'), ['safe=1', 'unsafe=1Injected: true']);
+    });
+
+    it('should not allow header injection through a serialized header string', function () {
+      const headers = new AxiosHeaders({'x-test': 'ok\r\nInjected: yes'});
+
+      assert.strictEqual(headers.toString(), 'x-test: okInjected: yes');
+    });
+
+    it('should preserve valid header value characters', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('x-test', 'a\tb ~\u0080ÿ');
+
+      assert.strictEqual(headers.get('x-test'), 'a\tb ~\u0080ÿ');
+    });
+  });
 });
