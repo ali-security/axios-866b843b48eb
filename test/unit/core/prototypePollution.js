@@ -2,6 +2,8 @@
 
 import assert from "assert";
 import http from "http";
+import net from "net";
+import vm from "vm";
 import axios from "../../../index.js";
 import utils from "../../../lib/utils.js";
 import mergeConfig from "../../../lib/core/mergeConfig.js";
@@ -1826,6 +1828,451 @@ describe("Prototype Pollution Protection", function () {
 
       assert.strictEqual(res.status, 200);
       assert.strictEqual(sink.config.url, 'http://example.com/users');
+    });
+  });
+
+  // Runtime option hardening: values inherited only from a shared prototype
+  // (including another realm's Object.prototype) must not become request
+  // behavior after config merging, after an interceptor replaces the config,
+  // or when read by the transport, FormData and serializer layers.
+  describe('runtime option prototype hardening', function () {
+    const respond = (config, data) => Promise.resolve({
+      data: data === undefined ? 'ok' : data,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config,
+      request: {},
+    });
+
+    const captureAdapter = (sink) => function (config) {
+      sink.config = config;
+      return respond(config);
+    };
+
+    afterEach(function () {
+      delete Object.prototype.createConnection;
+      delete Object.prototype.getHeaders;
+      delete Object.prototype.visitor;
+      delete Object.prototype.maxDepth;
+      delete Object.prototype[Symbol.iterator];
+    });
+
+    describe('request method', function () {
+      it('should use GET when the default instance has no own method', async function () {
+        Object.prototype.method = 'DELETE';
+        const sink = {};
+
+        const res = await axios({
+          url: 'http://example.com/default-method',
+          adapter: captureAdapter(sink),
+        });
+
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(sink.config.method, 'get');
+      });
+
+      it('should still honor an own method', async function () {
+        Object.prototype.method = 'DELETE';
+        const sink = {};
+
+        await axios({
+          url: 'http://example.com/own-method',
+          method: 'PUT',
+          adapter: captureAdapter(sink),
+        });
+
+        assert.strictEqual(sink.config.method, 'put');
+      });
+    });
+
+    describe('interceptor replacement at the dispatch boundary', function () {
+      it('should ignore headers inherited after a request interceptor replaces config', async function () {
+        Object.prototype.headers = { 'X-Injected': 'yes' };
+        const sink = {};
+        const instance = axios.create({ adapter: captureAdapter(sink) });
+
+        instance.interceptors.request.use((config) => {
+          const replacement = { ...config };
+          delete replacement.headers;
+          return replacement;
+        });
+
+        await instance.get('http://example.com/interceptor-headers');
+
+        assert.strictEqual(sink.config.headers.get('X-Injected'), undefined);
+      });
+
+      it('should ignore behavior inherited after a request interceptor replaces config', async function () {
+        let requestTransformCalled = false;
+        let responseTransformCalled = false;
+
+        Object.prototype.transformRequest = () => {
+          requestTransformCalled = true;
+        };
+        Object.prototype.transformResponse = () => {
+          responseTransformCalled = true;
+        };
+        Object.prototype.cancelToken = {
+          throwIfRequested() {
+            throw new Error('unexpected inherited cancelToken');
+          },
+        };
+        Object.prototype.signal = { aborted: true };
+        Object.prototype.method = 'delete';
+
+        const sink = {};
+        const instance = axios.create({ adapter: captureAdapter(sink) });
+
+        instance.interceptors.request.use((config) => {
+          const replacement = { ...config };
+          delete replacement.transformRequest;
+          delete replacement.transformResponse;
+          delete replacement.cancelToken;
+          delete replacement.signal;
+          delete replacement.method;
+          return replacement;
+        });
+
+        const res = await instance.get('http://example.com/interceptor-behavior');
+
+        assert.strictEqual(requestTransformCalled, false);
+        assert.strictEqual(responseTransformCalled, false);
+        assert.strictEqual(res.data, 'ok');
+        assert.strictEqual(sink.config.method, undefined);
+      });
+
+      it('should ignore an adapter inherited after a request interceptor replaces config', async function () {
+        let called = false;
+
+        Object.prototype.adapter = function (config) {
+          called = true;
+          return respond(config, 'hijacked');
+        };
+
+        const instance = axios.create();
+
+        instance.interceptors.request.use((config) => {
+          const replacement = { ...config };
+          delete replacement.adapter;
+          return replacement;
+        });
+
+        const res = await instance.get('data:text/plain;base64,c2FmZQ==', { responseType: 'text' });
+
+        assert.strictEqual(called, false);
+        assert.strictEqual(res.data, 'safe');
+      });
+
+      it('should preserve config inherited from a non-shared prototype after interception', async function () {
+        const instance = axios.create();
+
+        instance.interceptors.request.use((config) => {
+          const replacement = Object.create({
+            adapter: (resolvedConfig) => respond(resolvedConfig, resolvedConfig.customValue),
+            customValue: 'preserved',
+          });
+
+          replacement.url = config.url;
+          replacement.method = config.method;
+          replacement.headers = config.headers;
+
+          return replacement;
+        });
+
+        const res = await instance.get('/prototype-template');
+
+        assert.strictEqual(res.data, 'preserved');
+      });
+
+      [
+        ['unchanged', ''],
+        ['set to null', 'Object.prototype.constructor = null;'],
+        ['deleted', 'delete Object.prototype.constructor;'],
+        [
+          'replaced by an accessor',
+          "Object.defineProperty(Object.prototype, 'constructor', {" +
+            ' configurable: true, get: function () { return Object; } });',
+        ],
+      ].forEach(([description, mutateConstructor]) => {
+        it(`should exclude a foreign realm Object.prototype with its constructor ${description}`, async function () {
+          const context = vm.createContext({
+            adapter: (config) => respond(config, config.customValue),
+          });
+
+          const replacement = vm.runInContext(
+            "Object.prototype.transformResponse = function () { return 'polluted'; };" +
+              mutateConstructor +
+              "Object.create({ adapter: adapter, customValue: 'preserved' });",
+            context
+          );
+
+          const instance = axios.create();
+
+          instance.interceptors.request.use((config) => {
+            replacement.url = config.url;
+            replacement.method = config.method;
+            replacement.headers = config.headers;
+
+            return replacement;
+          });
+
+          const res = await instance.get('/cross-realm-prototype-template');
+
+          assert.strictEqual(res.data, 'preserved');
+        });
+      });
+
+      it('should preserve an unchanged merged config through dispatch', async function () {
+        let interceptedConfig;
+        let adapterConfig;
+
+        const instance = axios.create({
+          adapter: (config) => {
+            adapterConfig = config;
+            return respond(config);
+          },
+        });
+
+        instance.interceptors.request.use((config) => {
+          interceptedConfig = config;
+          return config;
+        });
+
+        const res = await instance.get('/config-identity');
+
+        assert.strictEqual(adapterConfig, interceptedConfig);
+        assert.strictEqual(res.config, interceptedConfig);
+        assert.strictEqual(Object.getPrototypeOf(adapterConfig), null);
+        assert.strictEqual(
+          Object.prototype.propertyIsEnumerable.call(adapterConfig, 'hasOwnProperty'),
+          false
+        );
+        assert.strictEqual(Object.keys(adapterConfig).includes('hasOwnProperty'), false);
+      });
+
+      it('should materialize a frozen null-prototype interceptor replacement', async function () {
+        let replacement;
+
+        const instance = axios.create({ adapter: (config) => respond(config) });
+
+        instance.interceptors.request.use((config) => {
+          replacement = Object.freeze(Object.assign(Object.create(null), config));
+          return replacement;
+        });
+
+        const res = await instance.get('/frozen-replacement');
+
+        assert.strictEqual(res.data, 'ok');
+        assert.notStrictEqual(res.config, replacement);
+        assert.strictEqual(Object.getPrototypeOf(res.config), null);
+        assert.strictEqual(Object.isFrozen(res.config), false);
+      });
+
+      it('should filter unsafe keys from a null-prototype interceptor replacement', async function () {
+        let replacement;
+
+        const instance = axios.create({
+          adapter: (config) => respond(config, {
+            safe: config.safe,
+            hasProto: Object.prototype.hasOwnProperty.call(config, '__proto__'),
+            hasConstructor: Object.prototype.hasOwnProperty.call(config, 'constructor'),
+            hasPrototype: Object.prototype.hasOwnProperty.call(config, 'prototype'),
+          }),
+        });
+
+        instance.interceptors.request.use((config) => {
+          replacement = Object.assign(Object.create(null), config);
+          replacement.safe = 'preserved';
+          Object.defineProperty(replacement, '__proto__', {
+            value: 'excluded',
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
+          replacement.constructor = 'excluded';
+          replacement.prototype = 'excluded';
+          return replacement;
+        });
+
+        const res = await instance.get('/unsafe-own-keys');
+
+        assert.deepStrictEqual(res.data, {
+          safe: 'preserved',
+          hasProto: false,
+          hasConstructor: false,
+          hasPrototype: false,
+        });
+        assert.notStrictEqual(res.config, replacement);
+      });
+
+      it('should normalize a class-based interceptor replacement', async function () {
+        let replacement;
+
+        class ConfigTemplate {
+          marker() {
+            return 'template';
+          }
+        }
+
+        const instance = axios.create({
+          adapter: (config) => respond(config, config.marker()),
+        });
+
+        instance.interceptors.request.use((config) => {
+          replacement = new ConfigTemplate();
+          replacement.url = config.url;
+          replacement.method = config.method;
+          replacement.headers = config.headers;
+          replacement.adapter = config.adapter;
+          return replacement;
+        });
+
+        const res = await instance.get('/normalized-replacement');
+
+        assert.strictEqual(res.data, 'template');
+        assert.notStrictEqual(res.config, replacement);
+        assert.strictEqual(res.config instanceof ConfigTemplate, false);
+        assert.strictEqual(Object.getPrototypeOf(res.config), null);
+        assert.strictEqual(Object.prototype.hasOwnProperty.call(res.config, 'marker'), true);
+      });
+
+      it('should keep config.hasOwnProperty available on a materialized replacement', async function () {
+        const sink = {};
+        const instance = axios.create({ adapter: captureAdapter(sink) });
+
+        instance.interceptors.request.use((config) => ({ ...config, custom: 'value' }));
+
+        await instance.get('/has-own-property');
+
+        assert.strictEqual(Object.getPrototypeOf(sink.config), null);
+        assert.strictEqual(sink.config.custom, 'value');
+        assert.strictEqual(sink.config.hasOwnProperty('custom'), true);
+        assert.strictEqual(Object.keys(sink.config).includes('hasOwnProperty'), false);
+      });
+    });
+
+    describe('transport options', function () {
+      it('should pass an own inert createConnection option to transports', async function () {
+        this.timeout(10000);
+        Object.prototype.createConnection = () => {
+          throw new Error('unexpected inherited createConnection');
+        };
+
+        const server = await startServer('ok');
+        let ownInert = null;
+
+        try {
+          const res = await axios.get(serverURL(server), {
+            transport: {
+              request(options, handleResponse) {
+                ownInert =
+                  Object.prototype.hasOwnProperty.call(options, 'createConnection') &&
+                  options.createConnection === undefined;
+                return http.request(options, handleResponse);
+              },
+            },
+          });
+
+          assert.strictEqual(res.data, 'ok');
+          assert.strictEqual(ownInert, true);
+        } finally {
+          delete Object.prototype.createConnection;
+          await stopServer(server);
+        }
+      });
+
+      it('should not let a polluted createConnection open the request socket', async function () {
+        this.timeout(10000);
+        let hijacked = false;
+
+        Object.prototype.createConnection = function (opts) {
+          hijacked = true;
+          return net.createConnection({ host: opts.hostname || opts.host, port: opts.port });
+        };
+
+        const server = await startServer('ok');
+
+        try {
+          const res = await axios.get(serverURL(server));
+
+          assert.strictEqual(res.data, 'ok');
+          assert.strictEqual(hijacked, false, 'polluted createConnection must not be used');
+        } finally {
+          delete Object.prototype.createConnection;
+          await stopServer(server);
+        }
+      });
+    });
+
+    describe('FormData hooks', function () {
+      it('should not call a FormData getHeaders inherited from Object.prototype', function () {
+        if (typeof globalThis.FormData !== 'function') {
+          this.skip();
+        }
+
+        let called = false;
+        Object.prototype.getHeaders = () => {
+          called = true;
+          return { 'Content-Type': 'application/x-injected' };
+        };
+
+        const resolved = resolveConfig({
+          url: '/upload',
+          data: new globalThis.FormData(),
+        });
+
+        assert.strictEqual(called, false);
+        assert.notStrictEqual(resolved.headers.get('Content-Type'), 'application/x-injected');
+      });
+    });
+
+    describe('serializer options', function () {
+      it('should not serialize params with a visitor inherited from Object.prototype', function () {
+        Object.prototype.visitor = function () {
+          this.append('injected', 'yes');
+          return false;
+        };
+
+        const uri = axios.getUri({ url: '/api', params: { a: '1' } });
+
+        assert.strictEqual(uri, '/api?a=1');
+      });
+
+      it('should not apply a maxDepth inherited from Object.prototype to params', function () {
+        Object.prototype.maxDepth = 0;
+
+        const uri = axios.getUri({ url: '/api', params: { a: { b: '1' } } });
+
+        assert.ok(uri.indexOf('/api?') === 0);
+        assert.ok(uri.indexOf('=1') !== -1);
+      });
+    });
+
+    describe('headers iteration', function () {
+      it('should not let a polluted Object.prototype[Symbol.iterator] inject request headers', async function () {
+        const sink = {};
+
+        Object.defineProperty(Object.prototype, Symbol.iterator, {
+          configurable: true,
+          writable: true,
+          value: function* () {
+            yield ['X-Injected', 'yes'];
+          },
+        });
+
+        try {
+          await axios.get('http://example.com/users', {
+            adapter: captureAdapter(sink),
+            headers: { 'X-Own': '1' },
+          });
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+
+        assert.strictEqual(sink.config.headers.get('X-Injected'), undefined);
+        assert.strictEqual(sink.config.headers.get('X-Own'), '1');
+      });
     });
   });
 });
